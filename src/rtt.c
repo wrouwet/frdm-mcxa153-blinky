@@ -41,17 +41,28 @@ void rtt_init(void)
     _SEGGER_RTT.up[0].rd_off = 0;
 }
 
-void rtt_puts(const char *s)
+void rtt_write(const char *data, unsigned int len)
 {
     rtt_channel_t *ch = &_SEGGER_RTT.up[0];
-    while (*s)
+    while (len--)
     {
         unsigned int next = (ch->wr_off + 1U) % ch->size;
         if (next == ch->rd_off)
         {
             break; /* buffer full, drop */
         }
-        ch->buffer[ch->wr_off] = *s++;
+        ch->buffer[ch->wr_off] = *data++;
         ch->wr_off = next;
     }
+}
+
+void rtt_puts(const char *s)
+{
+    unsigned int len = 0;
+    const char *p    = s;
+    while (*p++)
+    {
+        len++;
+    }
+    rtt_write(s, len);
 }
