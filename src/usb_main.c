@@ -106,8 +106,15 @@ static void LED_Init(void)
     GPIO3->PSOR             = (1U << LED_RED_PIN); /* off (active-low) */
     GPIO3->PDDR |= (1U << LED_RED_PIN);
 
-    /* Toggle every ~500 ms. */
-    SysTick_Config(SystemCoreClock / 2U);
+    /* Neither SystemCoreClock nor CLOCK_GetCoreSysClkFreq() (48 MHz) match
+     * the clock that actually drives SysTick's CLKSOURCE=1 "processor
+     * clock" input on this chip/board -- both produced a visibly faster
+     * blink than intended. This reload was calibrated by eye against the
+     * real board to give a ~2 Hz blink (full on/off cycle twice a second).
+     * Note SysTick->LOAD is only 24 bits wide (max ~16.7M), so any fix
+     * using a queried clock value needs a software tick counter rather
+     * than a single reload once the desired period gets much longer. */
+    SysTick_Config(12000000UL);
 }
 
 void USB_DeviceClockInit(void)
