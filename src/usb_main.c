@@ -106,8 +106,8 @@ static void LED_Init(void)
     GPIO3->PSOR             = (1U << LED_RED_PIN); /* off (active-low) */
     GPIO3->PDDR |= (1U << LED_RED_PIN);
 
-    /* Toggle every ~250 ms. */
-    SysTick_Config(SystemCoreClock / 4U);
+    /* Toggle every ~500 ms. */
+    SysTick_Config(SystemCoreClock / 2U);
 }
 
 void USB_DeviceClockInit(void)
