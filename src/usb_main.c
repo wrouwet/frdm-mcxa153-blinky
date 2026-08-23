@@ -24,6 +24,12 @@
 #include "usb_device_descriptor.h"
 #include "virtual_com.h"
 
+/* Heartbeat LED (same red channel used by the blinky demo, GPIO3 pin 12,
+ * active-low) so it's obvious the firmware is alive even with nothing
+ * plugged into the USB port yet. Driven from SysTick so it keeps blinking
+ * at a steady rate regardless of how busy the USB polling loop is. */
+#define LED_RED_PIN 12U
+
 /*******************************************************************************
  * Prototypes
  ******************************************************************************/
@@ -82,6 +88,26 @@ static usb_device_class_config_list_struct_t s_cdcAcmConfigList = {
 void USB0_IRQHandler(void)
 {
     USB_DeviceKhciIsrFunction(s_cdcVcom.deviceHandle);
+}
+
+void SysTick_Handler(void)
+{
+    GPIO3->PTOR = (1U << LED_RED_PIN);
+}
+
+static void LED_Init(void)
+{
+    SYSCON->CLKUNLOCK &= ~SYSCON_CLKUNLOCK_UNLOCK_MASK;
+    MRCC0->MRCC_GLB_CC1_SET  = MRCC_MRCC_GLB_CC1_PORT3_MASK | MRCC_MRCC_GLB_CC1_GPIO3_MASK;
+    MRCC0->MRCC_GLB_RST1_SET = MRCC_MRCC_GLB_RST1_PORT3_MASK | MRCC_MRCC_GLB_RST1_GPIO3_MASK;
+    SYSCON->CLKUNLOCK |= SYSCON_CLKUNLOCK_UNLOCK_MASK;
+
+    PORT3->PCR[LED_RED_PIN] = PORT_PCR_MUX(0U);
+    GPIO3->PSOR             = (1U << LED_RED_PIN); /* off (active-low) */
+    GPIO3->PDDR |= (1U << LED_RED_PIN);
+
+    /* Toggle every ~250 ms. */
+    SysTick_Config(SystemCoreClock / 4U);
 }
 
 void USB_DeviceClockInit(void)
@@ -372,6 +398,7 @@ usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *
  ******************************************************************************/
 static void APPInit(void)
 {
+    LED_Init();
     USB_DeviceClockInit();
 
     s_cdcVcom.speed        = USB_SPEED_FULL;
