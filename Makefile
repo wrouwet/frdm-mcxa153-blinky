@@ -39,17 +39,20 @@ APP_SRCS_C := \
 	$(SDK)/components/osa/fsl_os_abstraction_bm.c \
 	$(SDK)/components/lists/fsl_component_generic_list.c \
 	$(DEVICE_DIR)/drivers/fsl_clock.c \
-	$(DEVICE_DIR)/drivers/fsl_reset.c
+	$(DEVICE_DIR)/drivers/fsl_reset.c \
+	$(SDK)/drivers/lpi2c/fsl_lpi2c.c
 APP_INCLUDES := \
 	-Isrc/usb \
 	-I$(USB)/include \
 	-I$(USB)/device \
 	-I$(USB)/device/class \
 	-I$(SDK)/drivers/common \
+	-I$(SDK)/drivers/lpi2c \
+	-I$(SDK)/drivers/port \
 	-I$(SDK)/components/osa \
 	-I$(SDK)/components/lists \
 	-I$(DEVICE_DIR)/drivers
-APP_DEFINES := -DSDK_DEBUGCONSOLE=0
+APP_DEFINES := -DSDK_DEBUGCONSOLE=0 -DI2C_RETRY_TIMES=50000U
 
 else
 $(error Unknown TARGET '$(TARGET)'; use TARGET=blinky or TARGET=usb_vcom)

@@ -2,15 +2,18 @@
  * USB connector, wired to the MCX A153's own USB0 (KHCI) controller --
  * separate from the MCU-Link debug USB port.
  *
- * Behavior: echoes back whatever bytes the host sends, so opening the
- * enumerated /dev/ttyACMx (or COMx) port and typing something proves the
- * link works end-to-end. Adapted from NXP's official
+ * Behavior: accepts simple text commands over the CDC port and bridges
+ * them to an LPI2C0 master transaction, so a host PC can drive I2C
+ * devices on some other board through this one. See usage comment above
+ * process_command() for the command syntax. Adapted from NXP's official
  * usb_device_cdc_vcom "bm" (bare-metal) example for this exact board,
  * with the debug-console/board/clock_config scaffolding stripped out and
  * replaced by the RTT logger already used by the blinky demo.
  */
 #include <string.h>
 #include "fsl_device_registers.h"
+#include "fsl_lpi2c.h"
+#include "fsl_port.h"
 #include "rtt.h"
 
 #include "usb_device_config.h"
@@ -67,8 +70,17 @@ static uint8_t s_countryCode[COMM_FEATURE_DATA_SIZE] = {(COUNTRY_SETTING >> 0U) 
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static usb_cdc_acm_info_t s_usbCdcAcmInfo;
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_currRecvBuf[DATA_BUFF_SIZE];
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_currSendBuf[DATA_BUFF_SIZE];
-volatile static uint32_t s_recvSize = 0;
 volatile static uint32_t s_sendSize = 0;
+
+/* Command line assembly. Bytes arrive here as USB packets (possibly one
+ * character at a time, from an interactive terminal); s_lineReady is set
+ * once a full line has accumulated, and cleared again by APPTask() once
+ * it has built a reply. While a completed line is waiting to be answered,
+ * no further receive is armed (simple half-duplex command/response). */
+#define LINE_BUF_SIZE 128U
+static char s_lineBuf[LINE_BUF_SIZE];
+static uint32_t s_lineLen             = 0;
+volatile static bool s_lineReady      = false;
 
 static usb_device_class_config_struct_t s_cdcAcmConfig[1] = {{
     USB_DeviceCdcVcomCallback,
@@ -123,6 +135,52 @@ void USB_DeviceClockInit(void)
     CLOCK_EnableUsbfsClock();
 }
 
+/* LPI2C0 master, routed to PORT3 pins 27 (SCL) / 28 (SDA) via mux ALT2,
+ * which fan out to the board's mikroBUS header (J5) and Pmod connector
+ * (J7, unpopulated) -- confirmed against NXP's own lpi2c/polling_b2b
+ * example for this board. Clocked from the 12 MHz FRO (undivided), same
+ * clock-attach pattern as CLOCK_EnableUsbfsClock() uses for USB. */
+#define I2C_MASTER_CLOCK_HZ 12000000UL
+#define I2C_MASTER_BAUD_HZ  100000U
+
+static void I2C_Init(void)
+{
+    CLOCK_EnableClock(kCLOCK_GateLPI2C0);
+    CLOCK_EnableClock(kCLOCK_GatePORT3);
+    RESET_ReleasePeripheralReset(kLPI2C0_RST_SHIFT_RSTn);
+    RESET_ReleasePeripheralReset(kPORT3_RST_SHIFT_RSTn);
+
+    CLOCK_AttachClk(kFRO12M_to_LPI2C0);
+    CLOCK_SetClockDiv(kCLOCK_DivLPI2C0, 1U);
+
+    /* Enable the pins' internal pull-ups (matching NXP's own lpi2c
+     * reference config for these pins). I2C needs pull-ups to work at
+     * all; the internal ones are weak (~kOhm range, fine at 100 kHz) and
+     * mainly matter for bench-testing this bus with nothing wired to it
+     * yet -- an external target board will normally supply its own,
+     * stronger pull-ups once connected. */
+    const port_pin_config_t i2cPinConfig = {
+        .pullSelect          = kPORT_PullUp,
+        .pullValueSelect     = kPORT_LowPullResistor,
+        .slewRate            = kPORT_FastSlewRate,
+        .passiveFilterEnable = kPORT_PassiveFilterDisable,
+        .openDrainEnable     = kPORT_OpenDrainDisable,
+        .driveStrength       = kPORT_LowDriveStrength,
+        .driveStrength1      = kPORT_NormalDriveStrength,
+        .mux                 = kPORT_MuxAlt2,
+        .inputBuffer         = kPORT_InputBufferEnable,
+        .invertInput         = kPORT_InputNormal,
+        .lockRegister        = kPORT_UnlockRegister,
+    };
+    PORT_SetPinConfig(PORT3, 27U, &i2cPinConfig);
+    PORT_SetPinConfig(PORT3, 28U, &i2cPinConfig);
+
+    lpi2c_master_config_t config;
+    LPI2C_MasterGetDefaultConfig(&config);
+    config.baudRate_Hz = I2C_MASTER_BAUD_HZ;
+    LPI2C_MasterInit(LPI2C0, &config, I2C_MASTER_CLOCK_HZ);
+}
+
 void USB_DeviceIsrEnable(void)
 {
     uint8_t usbDeviceKhciIrq[] = USBFS_IRQS;
@@ -130,6 +188,279 @@ void USB_DeviceIsrEnable(void)
 
     NVIC_SetPriority((IRQn_Type)irqNumber, USB_DEVICE_INTERRUPT_PRIORITY);
     EnableIRQ((IRQn_Type)irqNumber);
+}
+
+/*******************************************************************************
+ * UART-to-I2C command bridge
+ *
+ * Line-based text protocol, one command per line (LF or CRLF terminated).
+ * <addr> is a 7-bit I2C address, <byte> a data byte -- both 1-2 hex
+ * digits, no "0x" prefix. <n> is a decimal byte count.
+ *
+ *   W <addr> <byte> [byte ...]     write bytes to <addr>
+ *   R <addr> <n>                   read <n> bytes from <addr>
+ *   X <addr> <n> <byte> [byte ...] write bytes, repeated-start, then
+ *                                  read <n> bytes (register-read pattern)
+ *   S                              scan the bus, list responding addresses
+ *
+ * Replies (also LF/CRLF terminated):
+ *   OK                             W succeeded
+ *   OK <byte> [byte ...]           R/X succeeded, with the read data
+ *   OK <addr> [addr ...]           S succeeded (may be empty if nothing found)
+ *   ERR <reason>                   something went wrong
+ *
+ * Example: reading 2 bytes starting at register 0x00 of a device at 0x50:
+ *   > X 50 2 00
+ *   < OK a1 b2
+ ******************************************************************************/
+/* Keep replies within one 64-byte USB full-speed packet: "OK" + N * "
+ * xx" + "\r\n" must fit, so N <= 16 leaves comfortable headroom. */
+#define I2C_CMD_MAX_DATA 16U
+
+static const char *skip_spaces(const char *p)
+{
+    while (*p == ' ')
+    {
+        p++;
+    }
+    return p;
+}
+
+static bool parse_hex_u32(const char **pp, uint32_t *out, uint32_t maxDigits)
+{
+    const char *p = skip_spaces(*pp);
+    uint32_t value = 0;
+    uint32_t ndig  = 0;
+    while (ndig < maxDigits)
+    {
+        char c = *p;
+        uint32_t digit;
+        if (c >= '0' && c <= '9')
+        {
+            digit = (uint32_t)(c - '0');
+        }
+        else if (c >= 'a' && c <= 'f')
+        {
+            digit = (uint32_t)(c - 'a' + 10);
+        }
+        else if (c >= 'A' && c <= 'F')
+        {
+            digit = (uint32_t)(c - 'A' + 10);
+        }
+        else
+        {
+            break;
+        }
+        value = (value << 4) | digit;
+        ndig++;
+        p++;
+    }
+    if (ndig == 0U)
+    {
+        return false;
+    }
+    *out = value;
+    *pp  = p;
+    return true;
+}
+
+static bool parse_dec_u32(const char **pp, uint32_t *out)
+{
+    const char *p = skip_spaces(*pp);
+    uint32_t value = 0;
+    uint32_t ndig  = 0;
+    while (*p >= '0' && *p <= '9')
+    {
+        value = (value * 10U) + (uint32_t)(*p - '0');
+        p++;
+        ndig++;
+    }
+    if (ndig == 0U)
+    {
+        return false;
+    }
+    *out = value;
+    *pp  = p;
+    return true;
+}
+
+static uint32_t append_str(char *buf, uint32_t pos, const char *s)
+{
+    while (*s)
+    {
+        buf[pos++] = *s++;
+    }
+    return pos;
+}
+
+static uint32_t append_hex_byte(char *buf, uint32_t pos, uint8_t v)
+{
+    static const char hexdigits[] = "0123456789abcdef";
+    buf[pos++]                    = hexdigits[(v >> 4) & 0xFU];
+    buf[pos++]                    = hexdigits[v & 0xFU];
+    return pos;
+}
+
+/* I2C_RETRY_TIMES is overridden (see Makefile) to a finite value so a
+ * floating/unwired bus (no target attached, no pull-ups) fails fast with
+ * kStatus_LPI2C_Timeout instead of hanging the whole command loop forever. */
+static const char *i2c_error_str(status_t status)
+{
+    if (status == kStatus_LPI2C_Nak)
+    {
+        return "ERR nak";
+    }
+    if (status == kStatus_LPI2C_Timeout)
+    {
+        return "ERR timeout (check wiring/pull-ups)";
+    }
+    return "ERR i2c";
+}
+
+/* Processes one received command line (not including its line ending) and
+ * writes a reply (not including its line ending) into outBuf. Returns the
+ * reply length. outBuf must be at least DATA_BUFF_SIZE bytes. */
+static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf)
+{
+    const char *p = skip_spaces(line);
+    char cmd      = *p;
+    if (cmd >= 'a' && cmd <= 'z')
+    {
+        cmd = (char)(cmd - 'a' + 'A');
+    }
+    p++;
+
+    if (cmd != 'S' && cmd != 'W' && cmd != 'R' && cmd != 'X')
+    {
+        return append_str(outBuf, 0, "ERR bad command");
+    }
+
+    if (cmd == 'S')
+    {
+        /* Probe each address with a zero-length write, the standard I2C
+         * scan idiom: it's just a START + address byte + STOP, and
+         * LPI2C_MasterTransferBlocking() correctly waits for and reports
+         * a NAK. (The lower-level LPI2C_MasterStart() alone does *not* --
+         * it only enqueues the START command into the hardware FIFO and
+         * returns, without waiting to see whether the address was
+         * actually acknowledged on the bus -- so it can't be used to
+         * detect a NAK by itself.) */
+        uint32_t pos = append_str(outBuf, 0, "OK");
+        for (uint32_t addr = 0x08U; addr <= 0x77U; addr++)
+        {
+            lpi2c_master_transfer_t probe = {0};
+            probe.slaveAddress             = (uint16_t)addr;
+            probe.direction                = kLPI2C_Write;
+            probe.flags                    = kLPI2C_TransferDefaultFlag;
+
+            if (kStatus_Success == LPI2C_MasterTransferBlocking(LPI2C0, &probe))
+            {
+                outBuf[pos++] = ' ';
+                pos           = append_hex_byte(outBuf, pos, (uint8_t)addr);
+            }
+        }
+        return pos;
+    }
+
+    uint32_t addr;
+    if (!parse_hex_u32(&p, &addr, 2U) || addr > 0x7FU)
+    {
+        return append_str(outBuf, 0, "ERR bad address");
+    }
+
+    if (cmd == 'W' || cmd == 'X')
+    {
+        uint32_t readCount = 0;
+        if (cmd == 'X')
+        {
+            if (!parse_dec_u32(&p, &readCount) || readCount > I2C_CMD_MAX_DATA)
+            {
+                return append_str(outBuf, 0, "ERR bad count");
+            }
+        }
+
+        uint8_t data[I2C_CMD_MAX_DATA];
+        uint32_t dataLen = 0;
+        uint32_t byte;
+        while (dataLen < I2C_CMD_MAX_DATA && parse_hex_u32(&p, &byte, 2U))
+        {
+            data[dataLen++] = (uint8_t)byte;
+        }
+
+        lpi2c_master_transfer_t xfer = {0};
+        xfer.slaveAddress             = (uint16_t)addr;
+        xfer.direction                = kLPI2C_Write;
+        xfer.data                     = data;
+        xfer.dataSize                 = dataLen;
+        xfer.flags                    = (cmd == 'X') ? kLPI2C_TransferNoStopFlag : kLPI2C_TransferDefaultFlag;
+
+        status_t status = LPI2C_MasterTransferBlocking(LPI2C0, &xfer);
+        if (status != kStatus_Success)
+        {
+            return append_str(outBuf, 0, i2c_error_str(status));
+        }
+
+        if (cmd == 'W')
+        {
+            return append_str(outBuf, 0, "OK");
+        }
+
+        uint8_t rdata[I2C_CMD_MAX_DATA];
+        lpi2c_master_transfer_t rxfer = {0};
+        rxfer.slaveAddress             = (uint16_t)addr;
+        rxfer.direction                = kLPI2C_Read;
+        rxfer.data                     = rdata;
+        rxfer.dataSize                 = readCount;
+        rxfer.flags                    = kLPI2C_TransferRepeatedStartFlag;
+
+        status = LPI2C_MasterTransferBlocking(LPI2C0, &rxfer);
+        if (status != kStatus_Success)
+        {
+            return append_str(outBuf, 0, i2c_error_str(status));
+        }
+
+        uint32_t pos = append_str(outBuf, 0, "OK");
+        for (uint32_t i = 0; i < readCount; i++)
+        {
+            outBuf[pos++] = ' ';
+            pos           = append_hex_byte(outBuf, pos, rdata[i]);
+        }
+        return pos;
+    }
+
+    if (cmd == 'R')
+    {
+        uint32_t count;
+        if (!parse_dec_u32(&p, &count) || count > I2C_CMD_MAX_DATA)
+        {
+            return append_str(outBuf, 0, "ERR bad count");
+        }
+
+        uint8_t rdata[I2C_CMD_MAX_DATA];
+        lpi2c_master_transfer_t xfer = {0};
+        xfer.slaveAddress             = (uint16_t)addr;
+        xfer.direction                = kLPI2C_Read;
+        xfer.data                     = rdata;
+        xfer.dataSize                 = count;
+        xfer.flags                    = kLPI2C_TransferDefaultFlag;
+
+        status_t status = LPI2C_MasterTransferBlocking(LPI2C0, &xfer);
+        if (status != kStatus_Success)
+        {
+            return append_str(outBuf, 0, i2c_error_str(status));
+        }
+
+        uint32_t pos = append_str(outBuf, 0, "OK");
+        for (uint32_t i = 0; i < count; i++)
+        {
+            outBuf[pos++] = ' ';
+            pos           = append_hex_byte(outBuf, pos, rdata[i]);
+        }
+        return pos;
+    }
+
+    (void)lineLen;
+    return append_str(outBuf, 0, "ERR bad command");
 }
 
 /*******************************************************************************
@@ -174,9 +505,40 @@ usb_status_t USB_DeviceCdcVcomCallback(class_handle_t handle, uint32_t event, vo
             }
             else if ((1U == s_cdcVcom.attach) && (1U == s_cdcVcom.startTransactions))
             {
-                s_recvSize = epCbParam->length;
-                error      = kStatus_USB_Success;
-                if (0U == s_recvSize)
+                error = kStatus_USB_Success;
+
+                bool lineDone = false;
+                for (uint32_t i = 0; i < epCbParam->length && !lineDone; i++)
+                {
+                    char c = (char)s_currRecvBuf[i];
+                    if (c == '\n')
+                    {
+                        lineDone = true;
+                    }
+                    else if (c != '\r')
+                    {
+                        /* Reserve the last slot for the NUL terminator below. */
+                        if (s_lineLen < LINE_BUF_SIZE - 1U)
+                        {
+                            s_lineBuf[s_lineLen++] = c;
+                        }
+                        else
+                        {
+                            lineDone = true; /* overflow: treat as a (too-long) line so we reply and reset */
+                        }
+                    }
+                }
+
+                if (lineDone)
+                {
+                    /* NUL-terminate so the hand-rolled hex/decimal parsers in
+                     * process_command() stop at the real end of the line
+                     * instead of reading stale bytes left over in this
+                     * static buffer from a previous, longer command. */
+                    s_lineBuf[s_lineLen] = '\0';
+                    s_lineReady           = true; /* APPTask() will reply, then re-arm the next receive */
+                }
+                else
                 {
                     error = USB_DeviceCdcAcmRecv(handle, USB_CDC_VCOM_BULK_OUT_ENDPOINT, s_currRecvBuf,
                                                   g_UsbDeviceCdcVcomDicEndpoints[1].maxPacketSize);
@@ -406,6 +768,7 @@ usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *
 static void APPInit(void)
 {
     LED_Init();
+    I2C_Init();
     USB_DeviceClockInit();
 
     s_cdcVcom.speed        = USB_SPEED_FULL;
@@ -437,16 +800,15 @@ static void APPTask(void)
 
     if ((1U == s_cdcVcom.attach) && (1U == s_cdcVcom.startTransactions))
     {
-        if ((0 != s_recvSize) && (USB_CANCELLED_TRANSFER_LENGTH != s_recvSize))
+        if (s_lineReady && (0U == s_sendSize))
         {
-            uint32_t sr = DisableGlobalIRQ();
-            if ((0U != s_recvSize) && (USB_CANCELLED_TRANSFER_LENGTH != s_recvSize))
-            {
-                memcpy(s_currSendBuf, s_currRecvBuf, s_recvSize);
-                s_sendSize = s_recvSize;
-                s_recvSize = 0;
-            }
-            EnableGlobalIRQ(sr);
+            uint32_t replyLen = process_command(s_lineBuf, s_lineLen, (char *)s_currSendBuf);
+            s_currSendBuf[replyLen++] = '\r';
+            s_currSendBuf[replyLen++] = '\n';
+
+            s_lineLen   = 0;
+            s_lineReady = false;
+            s_sendSize  = replyLen;
         }
 
         if (0U != s_sendSize)

@@ -11,8 +11,10 @@ Two demos share the same toolchain and vendor tree:
 - **`blinky`** — toggles the on-board RGB LED's red channel (GPIO3 pin 12).
 - **`usb_vcom`** — brings up a USB CDC-ACM virtual COM port on the MCX
   A153's *own* USB0 controller (the board's second, "MCU USB" Type-C
-  connector — separate from the MCU-Link debug port) and echoes back
-  whatever bytes the host sends it.
+  connector — separate from the MCU-Link debug port), and bridges it to
+  an LPI2C0 master, so a host PC can drive I2C devices on some other
+  board through this one with simple text commands. Also blinks the red
+  LED (~2 Hz) as a standalone heartbeat.
 
 Both stream progress messages back over SWD via a minimal hand-rolled
 SEGGER RTT implementation (`src/rtt.c`), so you can see what the firmware
@@ -37,14 +39,34 @@ probe-rs run --chip MCXA153 build/blinky/blinky.elf   # flash + live RTT log
 For `usb_vcom`, after flashing, plug a **data-capable** USB-C cable (not a
 charge-only one) into the board's lower Type-C port (silkscreened "MCU
 USB", labeled `J8` in the schematic) while leaving the MCU-Link port
-connected. It enumerates as `NXP MCU VIRTUAL COM DEMO` (`1fc9:0094`),
-typically at `/dev/ttyACM1`:
+connected. Wire an I2C target's SCL/SDA (+ GND) to the board's mikroBUS
+header (`J5`: `SCL`/`SDA` pins, wired to the MCX A153's `P3_27`/`P3_28`).
+It enumerates as `NXP MCU VIRTUAL COM DEMO` (`1fc9:0094`), typically at
+`/dev/ttyACM1`:
 
 ```sh
 stty -F /dev/ttyACM1 raw -echo speed 115200
 cat /dev/ttyACM1 &
-printf 'hello board\r\n' > /dev/ttyACM1   # should echo straight back
+printf 'S\r\n' > /dev/ttyACM1     # scan the bus, lists responding addresses
+printf 'W 50 00 2a\r\n' > /dev/ttyACM1   # write 0x00 0x2a to device 0x50
+printf 'X 50 2 00\r\n' > /dev/ttyACM1    # write 0x00, repeated-start, read 2 bytes
 ```
+
+### I2C bridge command syntax
+
+One command per line (LF or CRLF). `<addr>` is a 7-bit I2C address,
+`<byte>` a data byte — both 1-2 hex digits, no `0x` prefix. `<n>` is a
+decimal byte count.
+
+| Command | Meaning |
+|---|---|
+| `W <addr> <byte> [byte ...]` | write bytes to `<addr>` |
+| `R <addr> <n>` | read `<n>` bytes from `<addr>` |
+| `X <addr> <n> <byte> [byte ...]` | write bytes, repeated-start, then read `<n>` bytes (the classic "select register, then read" pattern) |
+| `S` | scan the bus, list responding addresses |
+
+Replies: `OK` (write), `OK <byte> [byte ...]` (read/scan), or
+`ERR <reason>` (e.g. `ERR nak`, `ERR timeout ...`, `ERR bad address`).
 
 ## Layout
 
@@ -59,6 +81,7 @@ vendor/sdk/             NXP device headers, startup code, linker script,
                         (from nxp-mcuxpresso/legacy-mcux-sdk, BSD-3-Clause)
 vendor/usb/             NXP's USB device stack + CDC-ACM class driver
                         (from nxp-mcuxpresso/mcuxsdk-middleware-usb, BSD-3-Clause)
+vendor/sdk/drivers/lpi2c/  NXP's LPI2C master driver (legacy-mcux-sdk, BSD-3-Clause)
 vendor/cmsis/           Arm CMSIS-Core headers (from ARM-software/CMSIS_5, Apache-2.0)
 Makefile                plain GNU make build, no CMake/SDK manager required
 ```
@@ -85,3 +108,24 @@ cleanly and enabled its D+ pull-up with zero faults, but no host ever saw
 the device and no bus-reset event ever reached the firmware. Root cause
 was a charge-only USB-C cable (power wires only, no D+/D− data lines) —
 not a firmware bug. Swapping to a data-capable cable fixed it immediately.
+
+**Three gotchas building the I2C bridge**:
+
+1. `LPI2C_MasterStart()` alone does **not** tell you whether an address
+   was acknowledged — it only enqueues the START command into the
+   hardware FIFO and returns immediately, without waiting for the bus
+   transaction to actually complete. A bus scan built on it will report
+   false positives (and can wedge the bus for later addresses). Use
+   `LPI2C_MasterTransferBlocking()` with a zero-length write instead —
+   the standard I2C scan idiom — which correctly waits for and reports a
+   NAK.
+2. By default this LPI2C driver has `I2C_RETRY_TIMES == 0`, meaning "wait
+   forever" on a stuck bus — so scanning/writing to a floating,
+   unconnected bus (no target, no pull-ups) hangs forever instead of
+   failing. Override it via a compiler define (`-DI2C_RETRY_TIMES=50000U`
+   in the Makefile) to fail fast with `kStatus_LPI2C_Timeout` instead.
+3. A hand-rolled command-line parser needs a real end-of-string marker.
+   The line-assembly buffer here is a fixed, reused static array; without
+   explicitly NUL-terminating each completed line, a parser that just
+   scans forward for "not a digit" will happily read past the current
+   line into stale bytes left over from a previous, longer command.
