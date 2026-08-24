@@ -181,6 +181,68 @@ static void I2C_Init(void)
     LPI2C_MasterInit(LPI2C0, &config, I2C_MASTER_CLOCK_HZ);
 }
 
+/* This driver has no automatic bus-recovery: if a transfer times out
+ * (e.g. the target device is holding SCL or SDA low mid-transaction), the
+ * bus stays wedged and every subsequent transfer -- even a plain write --
+ * keeps failing until something forces the lines free again. This is the
+ * standard I2C recovery procedure: temporarily drive the pins as plain
+ * GPIO, clock SCL up to 9 times (enough for any slave stuck mid-byte to
+ * finish and release SDA), then drive a manual STOP condition, before
+ * switching the pins back to LPI2C0 and reinitializing the peripheral. */
+static void I2C_BusRecover(void)
+{
+    PORT3->PCR[27] = PORT_PCR_MUX(0U) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK; /* SCL, GPIO, pull-up */
+    PORT3->PCR[28] = PORT_PCR_MUX(0U) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK; /* SDA, GPIO, pull-up */
+
+    GPIO3->PDDR |= (1U << 27);  /* SCL: output */
+    GPIO3->PDDR &= ~(1U << 28); /* SDA: input, so we can see when it's released */
+    GPIO3->PSOR = (1U << 27);   /* SCL idle high */
+
+    for (int i = 0; i < 9; i++)
+    {
+        if (0U != (GPIO3->PDIR & (1U << 28)))
+        {
+            break; /* SDA already released */
+        }
+        GPIO3->PCOR = (1U << 27);
+        for (volatile int d = 0; d < 200; d++)
+        {
+        }
+        GPIO3->PSOR = (1U << 27);
+        for (volatile int d = 0; d < 200; d++)
+        {
+        }
+    }
+
+    /* Manual STOP condition: SDA low-to-high while SCL is high. */
+    GPIO3->PDDR |= (1U << 28);
+    GPIO3->PCOR = (1U << 28);
+    for (volatile int d = 0; d < 200; d++)
+    {
+    }
+    GPIO3->PSOR = (1U << 27);
+    for (volatile int d = 0; d < 200; d++)
+    {
+    }
+    GPIO3->PSOR = (1U << 28);
+    for (volatile int d = 0; d < 200; d++)
+    {
+    }
+    GPIO3->PDDR &= ~(1U << 28);
+
+    I2C_Init();
+}
+
+/* NAK is a normal "no device at this address" response and doesn't mean
+ * the bus is wedged, so only run recovery for the other failure classes. */
+static void i2c_recover_if_needed(status_t status)
+{
+    if (status != kStatus_Success && status != kStatus_LPI2C_Nak)
+    {
+        I2C_BusRecover();
+    }
+}
+
 void USB_DeviceIsrEnable(void)
 {
     uint8_t usbDeviceKhciIrq[] = USBFS_IRQS;
@@ -306,15 +368,25 @@ static uint32_t append_hex_byte(char *buf, uint32_t pos, uint8_t v)
  * kStatus_LPI2C_Timeout instead of hanging the whole command loop forever. */
 static const char *i2c_error_str(status_t status)
 {
-    if (status == kStatus_LPI2C_Nak)
+    switch (status)
     {
-        return "ERR nak";
+        case kStatus_LPI2C_Nak:
+            return "ERR nak";
+        case kStatus_LPI2C_Timeout:
+            return "ERR timeout (bus never went idle -- check wiring/pull-ups)";
+        case kStatus_LPI2C_PinLowTimeout:
+            return "ERR pin low timeout (SCL or SDA stuck low -- check wiring/short/target power)";
+        case kStatus_LPI2C_ArbitrationLost:
+            return "ERR arbitration lost (bus contention -- another master, or SDA/SCL swapped/shorted?)";
+        case kStatus_LPI2C_BitError:
+            return "ERR bit error (bus noise or a wire not making contact)";
+        case kStatus_LPI2C_FifoError:
+            return "ERR fifo error";
+        case kStatus_LPI2C_Busy:
+            return "ERR busy";
+        default:
+            return "ERR i2c (unknown status)";
     }
-    if (status == kStatus_LPI2C_Timeout)
-    {
-        return "ERR timeout (check wiring/pull-ups)";
-    }
-    return "ERR i2c";
 }
 
 /* Processes one received command line (not including its line ending) and
@@ -397,6 +469,7 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
         status_t status = LPI2C_MasterTransferBlocking(LPI2C0, &xfer);
         if (status != kStatus_Success)
         {
+            i2c_recover_if_needed(status);
             return append_str(outBuf, 0, i2c_error_str(status));
         }
 
@@ -416,6 +489,7 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
         status = LPI2C_MasterTransferBlocking(LPI2C0, &rxfer);
         if (status != kStatus_Success)
         {
+            i2c_recover_if_needed(status);
             return append_str(outBuf, 0, i2c_error_str(status));
         }
 
@@ -447,6 +521,7 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
         status_t status = LPI2C_MasterTransferBlocking(LPI2C0, &xfer);
         if (status != kStatus_Success)
         {
+            i2c_recover_if_needed(status);
             return append_str(outBuf, 0, i2c_error_str(status));
         }
 
@@ -768,6 +843,7 @@ usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *
 static void APPInit(void)
 {
     LED_Init();
+
     I2C_Init();
     USB_DeviceClockInit();
 

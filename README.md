@@ -41,15 +41,25 @@ charge-only one) into the board's lower Type-C port (silkscreened "MCU
 USB", labeled `J8` in the schematic) while leaving the MCU-Link port
 connected. Wire an I2C target's SCL/SDA (+ GND) to the board's mikroBUS
 header (`J5`: `SCL`/`SDA` pins, wired to the MCX A153's `P3_27`/`P3_28`).
-It enumerates as `NXP MCU VIRTUAL COM DEMO` (`1fc9:0094`), typically at
-`/dev/ttyACM1`:
+It enumerates as `NXP MCU VIRTUAL COM DEMO` (`1fc9:0094`). **Don't assume
+it's `/dev/ttyACM0` or `/dev/ttyACM1`** — the MCU-Link debug probe also
+exposes its own (unrelated) ttyACM device, and which one gets which
+number depends purely on enumeration order, which can and does change
+across reconnects. Find the right one by product string:
 
 ```sh
-stty -F /dev/ttyACM1 raw -echo speed 115200
-cat /dev/ttyACM1 &
-printf 'S\r\n' > /dev/ttyACM1     # scan the bus, lists responding addresses
-printf 'W 50 00 2a\r\n' > /dev/ttyACM1   # write 0x00 0x2a to device 0x50
-printf 'X 50 2 00\r\n' > /dev/ttyACM1    # write 0x00, repeated-start, read 2 bytes
+for dev in /sys/class/tty/ttyACM*; do
+  echo "$(basename "$dev") -> $(cat "$dev/device/../product" 2>/dev/null)"
+done
+# use whichever one prints "MCU VIRTUAL COM DEMO"
+```
+
+```sh
+stty -F /dev/ttyACM0 raw -echo speed 115200
+cat /dev/ttyACM0 &
+printf 'S\r\n' > /dev/ttyACM0     # scan the bus, lists responding addresses
+printf 'W 50 00 2a\r\n' > /dev/ttyACM0   # write 0x00 0x2a to device 0x50
+printf 'X 50 2 00\r\n' > /dev/ttyACM0    # write 0x00, repeated-start, read 2 bytes
 ```
 
 ### I2C bridge command syntax
@@ -129,3 +139,27 @@ not a firmware bug. Swapping to a data-capable cable fixed it immediately.
    explicitly NUL-terminating each completed line, a parser that just
    scans forward for "not a digit" will happily read past the current
    line into stale bytes left over from a previous, longer command.
+4. This LPI2C driver has no automatic bus recovery: once a transfer times
+   out (e.g. a target device holds SCL or SDA low mid-transaction), the
+   bus stays wedged and every subsequent transfer -- even a plain write --
+   fails too, until something forces the lines free. `I2C_BusRecover()` in
+   `usb_main.c` implements the standard fix (temporarily drive the pins as
+   GPIO, clock SCL up to 9 times, drive a manual STOP, then reinit LPI2C0)
+   and runs automatically after any non-NAK failure. Note this can only
+   recover a bus a *stuck peripheral* is wedging; it can't force a device
+   that's deliberately holding the line (e.g. one that doesn't like how a
+   read was issued) to let go -- that's a target-device protocol question,
+   not a bus electrical one.
+
+**The debugging red herring that ate the most time**: after wiring up a
+real I2C target, the bridge worked, then appeared to completely stop
+responding to *any* command -- no reply at all, not even an error --
+across power-cycles, replugs, and even full board power removal. The
+actual cause: this board's MCU-Link debug probe exposes its own,
+unrelated `ttyACM` device (a USB-to-UART bridge for a different LPUART),
+and repeated reconnects during testing caused the kernel to reassign
+which physical device got `ttyACM0` vs `ttyACM1`. Every "no response"
+was simply commands going to the wrong tty. Lesson: never hardcode a
+`ttyACM` number for a board with more than one CDC interface -- always
+resolve it by USB product string (see the `usb_vcom` usage section
+above).
