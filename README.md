@@ -85,6 +85,12 @@ decimal byte count.
 Replies: `OK` (write), `OK <byte> [byte ...]` (read/scan), or
 `ERR <reason>` (e.g. `ERR nak`, `ERR timeout ...`, `ERR bad address`).
 
+### Host-side test suite
+
+Testing a device on the far side of the bridge from a host PC (a pytest
+suite, currently targeting an OpenBIC controller) lives in a separate
+project: [openbic-test-environment](https://github.com/wrouwet/openbic-test-environment).
+
 ## Layout
 
 ```
