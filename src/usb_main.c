@@ -102,9 +102,16 @@ void USB0_IRQHandler(void)
     USB_DeviceKhciIsrFunction(s_cdcVcom.deviceHandle);
 }
 
+/* Bumped once per SysTick period (~250 ms, see the calibration note in
+ * LED_Init()) so other code can bound a wait without needing an accurate
+ * millisecond time base -- good enough for "give up eventually", not for
+ * precise timing. */
+volatile static uint32_t s_tickCount = 0;
+
 void SysTick_Handler(void)
 {
     GPIO3->PTOR = (1U << LED_RED_PIN);
+    s_tickCount++;
 }
 
 static void LED_Init(void)
@@ -179,6 +186,68 @@ static void I2C_Init(void)
     LPI2C_MasterGetDefaultConfig(&config);
     config.baudRate_Hz = I2C_MASTER_BAUD_HZ;
     LPI2C_MasterInit(LPI2C0, &config, I2C_MASTER_CLOCK_HZ);
+}
+
+/* Some I2C targets (e.g. an OpenBIC controller speaking IPMB) don't
+ * answer a request by being read from -- they reply by becoming bus
+ * MASTER themselves and writing the response out to whatever
+ * "requester address" was named in the request. To see that response,
+ * we have to temporarily become an I2C SLAVE ourselves at that address
+ * and catch the incoming write, then switch back to master mode
+ * afterwards. Polled rather than interrupt-driven, matching the rest of
+ * this file's fully-synchronous per-command design. */
+static bool I2C_SlaveWaitForWrite(uint8_t ourAddr, uint8_t *buf, uint32_t bufMax, uint32_t *outLen,
+                                   uint32_t timeoutTicks)
+{
+    LPI2C_MasterEnable(LPI2C0, false);
+
+    lpi2c_slave_config_t slaveConfig;
+    LPI2C_SlaveGetDefaultConfig(&slaveConfig);
+    slaveConfig.address0 = ourAddr;
+    LPI2C_SlaveInit(LPI2C0, &slaveConfig, I2C_MASTER_CLOCK_HZ);
+
+    uint32_t len       = 0;
+    bool sawAddress    = false;
+    bool gotStop       = false;
+    uint32_t startTick = s_tickCount;
+
+    while ((s_tickCount - startTick) <= timeoutTicks)
+    {
+        uint32_t status = LPI2C_SlaveGetStatusFlags(LPI2C0);
+
+        if (0U != (status & (uint32_t)kLPI2C_SlaveAddressValidFlag))
+        {
+            sawAddress = true;
+            (void)LPI2C0->SASR; /* reading SASR clears AVF */
+        }
+
+        if (0U != (status & (uint32_t)kLPI2C_SlaveRxReadyFlag))
+        {
+            uint32_t data = LPI2C0->SRDR;
+            if ((0U == (data & LPI2C_SRDR_RXEMPTY_MASK)) && (len < bufMax))
+            {
+                buf[len++] = (uint8_t)(data & LPI2C_SRDR_DATA_MASK);
+            }
+        }
+
+        if (0U != (status & (uint32_t)kLPI2C_SlaveStopDetectFlag))
+        {
+            LPI2C_SlaveClearStatusFlags(LPI2C0, (uint32_t)kLPI2C_SlaveStopDetectFlag);
+            if (sawAddress)
+            {
+                gotStop = true;
+                break;
+            }
+        }
+    }
+
+    LPI2C_SlaveEnable(LPI2C0, false);
+    I2C_Init(); /* back to master mode, with pins/clocks freshly reconfigured */
+
+    rtt_puts(sawAddress ? "slave: address was matched\r\n" : "slave: no address match seen\r\n");
+
+    *outLen = len;
+    return gotStop;
 }
 
 /* This driver has no automatic bus-recovery: if a transfer times out
@@ -264,10 +333,18 @@ void USB_DeviceIsrEnable(void)
  *   X <addr> <n> <byte> [byte ...] write bytes, repeated-start, then
  *                                  read <n> bytes (register-read pattern)
  *   S                              scan the bus, list responding addresses
+ *   I <addr> <ourAddr> <byte> [byte ...]
+ *                                  write bytes to <addr> (e.g. an IPMB
+ *                                  request), then briefly become an I2C
+ *                                  slave at <ourAddr> and capture whatever
+ *                                  the target writes back -- for devices
+ *                                  (like OpenBIC/IPMB) that respond by
+ *                                  becoming bus master themselves rather
+ *                                  than being read from
  *
  * Replies (also LF/CRLF terminated):
  *   OK                             W succeeded
- *   OK <byte> [byte ...]           R/X succeeded, with the read data
+ *   OK <byte> [byte ...]           R/X/I succeeded, with the data
  *   OK <addr> [addr ...]           S succeeded (may be empty if nothing found)
  *   ERR <reason>                   something went wrong
  *
@@ -402,7 +479,7 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
     }
     p++;
 
-    if (cmd != 'S' && cmd != 'W' && cmd != 'R' && cmd != 'X')
+    if (cmd != 'S' && cmd != 'W' && cmd != 'R' && cmd != 'X' && cmd != 'I')
     {
         return append_str(outBuf, 0, "ERR bad command");
     }
@@ -527,6 +604,54 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
 
         uint32_t pos = append_str(outBuf, 0, "OK");
         for (uint32_t i = 0; i < count; i++)
+        {
+            outBuf[pos++] = ' ';
+            pos           = append_hex_byte(outBuf, pos, rdata[i]);
+        }
+        return pos;
+    }
+
+    if (cmd == 'I')
+    {
+        uint32_t ourAddr;
+        if (!parse_hex_u32(&p, &ourAddr, 2U) || ourAddr > 0x7FU)
+        {
+            return append_str(outBuf, 0, "ERR bad requester address");
+        }
+
+        uint8_t data[I2C_CMD_MAX_DATA];
+        uint32_t dataLen = 0;
+        uint32_t byte;
+        while (dataLen < I2C_CMD_MAX_DATA && parse_hex_u32(&p, &byte, 2U))
+        {
+            data[dataLen++] = (uint8_t)byte;
+        }
+
+        lpi2c_master_transfer_t xfer = {0};
+        xfer.slaveAddress             = (uint16_t)addr;
+        xfer.direction                = kLPI2C_Write;
+        xfer.data                     = data;
+        xfer.dataSize                 = dataLen;
+        xfer.flags                    = kLPI2C_TransferDefaultFlag;
+
+        status_t status = LPI2C_MasterTransferBlocking(LPI2C0, &xfer);
+        if (status != kStatus_Success)
+        {
+            i2c_recover_if_needed(status);
+            return append_str(outBuf, 0, i2c_error_str(status));
+        }
+
+        uint8_t rdata[I2C_CMD_MAX_DATA];
+        uint32_t rlen = 0;
+        /* ~1s: a handful of SysTick periods (~250 ms each, see LED_Init()). */
+        bool got = I2C_SlaveWaitForWrite((uint8_t)ourAddr, rdata, I2C_CMD_MAX_DATA, &rlen, 16U);
+        if (!got)
+        {
+            return append_str(outBuf, 0, "ERR timeout waiting for response");
+        }
+
+        uint32_t pos = append_str(outBuf, 0, "OK");
+        for (uint32_t i = 0; i < rlen; i++)
         {
             outBuf[pos++] = ' ';
             pos           = append_hex_byte(outBuf, pos, rdata[i]);

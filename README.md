@@ -81,9 +81,16 @@ decimal byte count.
 | `R <addr> <n>` | read `<n>` bytes from `<addr>` |
 | `X <addr> <n> <byte> [byte ...]` | write bytes, repeated-start, then read `<n>` bytes (the classic "select register, then read" pattern) |
 | `S` | scan the bus, list responding addresses |
+| `I <addr> <ourAddr> <byte> [byte ...]` | write bytes to `<addr>`, then briefly become an I2C *slave* at `<ourAddr>` and capture whatever `<addr>` writes back |
 
-Replies: `OK` (write), `OK <byte> [byte ...]` (read/scan), or
+Replies: `OK` (write), `OK <byte> [byte ...]` (read/scan/`I`), or
 `ERR <reason>` (e.g. `ERR nak`, `ERR timeout ...`, `ERR bad address`).
+
+`I` exists for targets that don't respond by being *read* from -- e.g. an
+IPMB device, which replies by becoming bus master itself and writing the
+response out to whichever address the request named as the requester.
+`<ourAddr>` is that requester address; the bridge listens there (bounded,
+~4s) for the write-back and returns whatever it captured.
 
 ### Host-side test suite
 
