@@ -1,20 +1,27 @@
-# FRDM-MCXA153 Bare-Metal Demos
+# FRDM-MCXA153 USB-to-I2C Hub
 
-A minimal, from-scratch, command-line-only development environment for NXP's
-[FRDM-MCXA153](https://www.nxp.com/design/design-center/development-boards-and-designs/FRDM-MCXA153)
-board (MCX A153, Arm Cortex-M33). No IDE, no MCUXpresso installer — just
-`arm-none-eabi-gcc`, `make`, and [`probe-rs`](https://probe.rs/) talking to
-the board's on-board MCU-Link debug probe over SWD.
+Turns NXP's [FRDM-MCXA153](https://www.nxp.com/design/design-center/development-boards-and-designs/FRDM-MCXA153)
+board (MCX A153, Arm Cortex-M33) into a USB-to-I2C bridge: plug it into a
+host PC over its "MCU USB" port, wire an I2C target to its mikroBUS
+header, and drive that target's I2C bus with simple text commands over a
+USB CDC virtual COM port. Once flashed, the board runs standalone off
+that one USB cable — no debug probe or separate power needed.
 
-Two demos share the same toolchain and vendor tree:
+Built from scratch as a minimal, command-line-only development
+environment for this board: no IDE, no MCUXpresso installer, just
+`arm-none-eabi-gcc`, `make`, and [`probe-rs`](https://probe.rs/) (used
+only for flashing, over the board's on-board MCU-Link debug probe).
 
-- **`blinky`** — toggles the on-board RGB LED's red channel (GPIO3 pin 12).
-- **`usb_vcom`** — brings up a USB CDC-ACM virtual COM port on the MCX
-  A153's *own* USB0 controller (the board's second, "MCU USB" Type-C
-  connector — separate from the MCU-Link debug port), and bridges it to
-  an LPI2C0 master, so a host PC can drive I2C devices on some other
-  board through this one with simple text commands. Also blinks the red
-  LED (~2 Hz) as a standalone heartbeat.
+Two firmware targets share the same toolchain and vendor tree:
+
+- **`usb_vcom`** — the USB-to-I2C hub itself. Brings up a USB CDC-ACM
+  virtual COM port on the MCX A153's *own* USB0 controller (the board's
+  second, "MCU USB" Type-C connector — separate from the MCU-Link debug
+  port), and bridges it to an LPI2C0 master, so a host PC can drive I2C
+  devices on another board through this one. Also blinks the red LED
+  (~2 Hz) as a standalone heartbeat.
+- **`blinky`** — a minimal standalone LED blink demo (GPIO3 pin 12),
+  kept as the simplest possible "does my toolchain work" sanity check.
 
 Both stream progress messages back over SWD via a minimal hand-rolled
 SEGGER RTT implementation (`src/rtt.c`), so you can see what the firmware
