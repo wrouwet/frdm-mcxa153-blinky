@@ -99,15 +99,45 @@ decimal byte count.
 | `S` | scan the bus, list responding addresses |
 | `I <addr> <ourAddr> <byte> [byte ...]` | write bytes to `<addr>`, then briefly become an I2C *slave* at `<ourAddr>` and capture whatever `<addr>` writes back |
 | `L <ourAddr>` | like `I`, but with no write of our own first -- just listen (useful for independently testing the slave-mode RX path against some other master) |
+| `WS`/`RS`/`XS` | SMBus flavor of `W`/`R`/`X` -- adds/checks a trailing PEC (Packet Error Check, CRC-8) byte per the SMBus spec. See "SMBus (PEC) support" below. |
 
 Replies: `OK` (write), `OK <byte> [byte ...]` (read/scan/`I`), or
-`ERR <reason>` (e.g. `ERR nak`, `ERR timeout ...`, `ERR bad address`).
+`ERR <reason>` (e.g. `ERR nak`, `ERR timeout ...`, `ERR bad address`,
+`ERR pec` for a failed SMBus PEC check).
 
 `I` exists for targets that don't respond by being *read* from -- e.g. an
 IPMB device, which replies by becoming bus master itself and writing the
 response out to whichever address the request named as the requester.
 `<ourAddr>` is that requester address; the bridge listens there (bounded,
 ~4s) for the write-back and returns whatever it captured.
+
+### SMBus (PEC) support
+
+`W`/`R`/`X` have SMBus counterparts -- `WS`/`RS`/`XS` (the `S` goes
+directly after the command letter, no space, e.g. `WS 50 00 2a`) -- that
+add or check a trailing **PEC** (Packet Error Check) byte per the SMBus
+spec: a CRC-8 (poly `0x07`, MSB-first, no reflection, init `0`) computed
+over every byte actually on the wire for the transaction, including the
+address+R/W byte(s) the LPI2C driver injects automatically. `RS`/`XS`
+report `ERR pec` instead of `OK <bytes>` if the trailing byte the device
+sent doesn't match what the bridge computes; the requested data bytes are
+still returned on success, with the PEC byte itself consumed rather than
+handed back. Added specifically to support future testing of SMBus-based
+protocols like MCTP-over-SMBus, which requires PEC on every frame --
+plain I2C traffic (including IPMB, which uses its own, unrelated
+checksum scheme) neither needs nor is affected by this; `W`/`R`/`X`
+without the `S` behave exactly as before.
+
+`tools/verify_smbus.py` (needs only `pip install pyserial`) verifies the
+PEC engine against the published CRC-8/SMBUS standard check value,
+independent of any hardware, then smoke-tests `WS`/`RS`/`XS` against
+whatever's on the bus. Read its module docstring before trusting a
+"PASS" from it: it can prove the CRC math is right and that transactions
+frame/complete correctly, but a genuine positive round trip against a
+real SMBus-PEC-aware device hasn't been demonstrated yet, since none has
+been available on the bench -- everything tested against so far
+(including OpenBIC's IPMB interface) correctly reports `ERR pec`, which
+is the expected result for a non-SMBus-PEC-aware device, not a bug.
 
 ### Host-side test suite
 
@@ -187,6 +217,27 @@ not a firmware bug. Swapping to a data-capable cable fixed it immediately.
    that's deliberately holding the line (e.g. one that doesn't like how a
    read was issued) to let go -- that's a target-device protocol question,
    not a bus electrical one.
+
+**Adding SMBus PEC without touching the existing plain-I2C commands**:
+the trickiest part wasn't the CRC-8 math itself (verified against the
+published CRC-8/SMBUS standard test vector -- see "SMBus (PEC) support"
+above) but getting the *byte accounting* right for a combined write+read
+transaction (`XS`): the PEC covers the address+R/W byte(s) too, but those
+never appear in this firmware's own data buffers since
+`LPI2C_MasterTransferBlocking()` generates and sends them itself as part
+of issuing START/repeated-START -- so they have to be fed into the
+running CRC by hand, in the right order, at the right point(s), separate
+from whatever's actually in `data[]`/`rdata[]`. Getting the order wrong
+(e.g. treating a plain write's PEC placement, right after its own data,
+as the model for `X`'s write *phase* too) would silently compute a wrong
+PEC that just never matches anything -- there's no compiler error or
+crash to catch that kind of mistake, only a real device's PEC failing to
+verify. Also had to reserve one byte of headroom in `I2C_CMD_MAX_DATA`-sized
+buffers specifically for the appended PEC byte, on both the write side
+(a plain `WS`'s data parse loop) and the read side (`RS`/`XS` requesting
+one extra byte over what the caller asked for) -- getting this wrong in
+either direction means either silently truncating a byte of real data or
+overflowing a fixed-size stack buffer.
 
 **The debugging red herring that ate the most time**: after wiring up a
 real I2C target, the bridge worked, then appeared to completely stop

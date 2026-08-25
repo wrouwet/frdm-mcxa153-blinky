@@ -340,6 +340,22 @@ void USB_DeviceIsrEnable(void)
  *   R <addr> <n>                   read <n> bytes from <addr>
  *   X <addr> <n> <byte> [byte ...] write bytes, repeated-start, then
  *                                  read <n> bytes (register-read pattern)
+ *   WS/RS/XS                       SMBus flavor of W/R/X: adds/checks a
+ *                                  trailing PEC (Packet Error Check,
+ *                                  CRC-8) byte per the SMBus spec, same
+ *                                  arguments otherwise. See the smbus_pec_*
+ *                                  helpers below for exactly which bytes
+ *                                  the CRC covers for each. RS/XS report
+ *                                  "ERR pec" (instead of the usual "OK
+ *                                  <bytes>") if the device's PEC byte
+ *                                  doesn't check out, and otherwise return
+ *                                  just the requested <n> data bytes --
+ *                                  the trailing PEC byte itself is
+ *                                  verified, not handed back to the
+ *                                  caller. The `S` modifier is only
+ *                                  recognized directly after `W`/`R`/`X`
+ *                                  (no space) -- it's unrelated to the
+ *                                  standalone `S` scan command below.
  *   S                              scan the bus, list responding addresses
  *   I <addr> <ourAddr> <byte> [byte ...]
  *                                  write bytes to <addr> (e.g. an IPMB
@@ -486,6 +502,40 @@ static const char *i2c_error_str(status_t status)
     }
 }
 
+/* SMBus PEC (Packet Error Check): a CRC-8 with polynomial x^8+x^2+x+1
+ * (0x07), MSB-first, no reflection, initial value 0 -- computed over
+ * every byte actually seen on the wire for a transaction, per the SMBus
+ * spec. Deliberately a plain bit-by-bit implementation rather than a
+ * lookup table: our transactions are at most a few dozen bytes, so the
+ * table's ROM/RAM cost isn't worth it here.
+ *
+ * Critically, this covers the address+R/W byte(s) too -- but those never
+ * appear in our own data[]/rdata[] buffers, since
+ * LPI2C_MasterTransferBlocking() generates and sends them itself as part
+ * of issuing START (and repeated START). So every call site below feeds
+ * (addr << 1) | rw by hand into the running CRC at the right point(s),
+ * in addition to whatever's actually in a data buffer -- get the byte
+ * ordering/count wrong here and PEC will silently never match, even
+ * though the underlying I2C bytes are all correct. */
+static uint8_t smbus_pec_byte(uint8_t crc, uint8_t b)
+{
+    crc = (uint8_t)(crc ^ b);
+    for (int i = 0; i < 8; i++)
+    {
+        crc = (crc & 0x80U) ? (uint8_t)((uint32_t)(crc << 1) ^ 0x07U) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
+static uint8_t smbus_pec_buf(uint8_t crc, const uint8_t *buf, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++)
+    {
+        crc = smbus_pec_byte(crc, buf[i]);
+    }
+    return crc;
+}
+
 /* Processes one received command line (not including its line ending) and
  * writes a reply (not including its line ending) into outBuf. Returns the
  * reply length. outBuf must be at least DATA_BUFF_SIZE bytes. */
@@ -580,6 +630,18 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
         return pos;
     }
 
+    /* Only W/R/X reach this point (S and L both return above), so this
+     * modifier check can't misfire on the standalone S/L commands. No
+     * space between the command letter and this 'S' -- "WS 50 ..." not
+     * "W S 50 ...' -- so it reads naturally as one token, "the SMBus
+     * flavor of W", rather than looking like a separate argument. */
+    bool smbusPec = false;
+    if (*p == 'S' || *p == 's')
+    {
+        smbusPec = true;
+        p++;
+    }
+
     uint32_t addr;
     if (!parse_hex_u32(&p, &addr, 2U) || addr > 0x7FU)
     {
@@ -600,9 +662,28 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
         uint8_t data[I2C_CMD_MAX_DATA];
         uint32_t dataLen = 0;
         uint32_t byte;
-        while (dataLen < I2C_CMD_MAX_DATA && parse_hex_u32(&p, &byte, 2U))
+        /* A plain SMBus write (WS) needs room for one extra, computed PEC
+         * byte appended after the caller's data below -- reserve it up
+         * front so the parse loop can't fill the buffer completely and
+         * leave no space for it. X's write phase never gets its own PEC
+         * (a combined write+read transaction has exactly one PEC, after
+         * the read phase, covering the whole thing -- see below), so it
+         * doesn't need this reservation. */
+        uint32_t dataMax = (smbusPec && cmd == 'W') ? (I2C_CMD_MAX_DATA - 1U) : I2C_CMD_MAX_DATA;
+        while (dataLen < dataMax && parse_hex_u32(&p, &byte, 2U))
         {
             data[dataLen++] = (uint8_t)byte;
+        }
+
+        /* Appending a plain write's PEC has to happen here, before the
+         * transfer, since it must go out as part of the SAME START..STOP
+         * transaction as the rest of the data -- not a second, separate
+         * one. */
+        if (smbusPec && cmd == 'W')
+        {
+            uint8_t pec = smbus_pec_byte(0U, (uint8_t)((addr << 1) | 0U));
+            pec         = smbus_pec_buf(pec, data, dataLen);
+            data[dataLen++] = pec;
         }
 
         lpi2c_master_transfer_t xfer = {0};
@@ -624,12 +705,26 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
             return append_str(outBuf, 0, "OK");
         }
 
+        /* X (and XS): read phase. For XS, PEC covers the WHOLE
+         * transaction -- write address+data, repeated start, read
+         * address+data -- as one continuous CRC, with the PEC byte
+         * itself appended by the target after its last real data byte.
+         * Ask for one extra byte so we can read and check it, but only
+         * ever report the requested readCount data bytes back to the
+         * caller -- the PEC byte itself is consumed here, not handed
+         * back. */
+        uint32_t readLen = readCount + (smbusPec ? 1U : 0U);
+        if (readLen > I2C_CMD_MAX_DATA)
+        {
+            return append_str(outBuf, 0, "ERR bad count");
+        }
+
         uint8_t rdata[I2C_CMD_MAX_DATA];
         lpi2c_master_transfer_t rxfer = {0};
         rxfer.slaveAddress             = (uint16_t)addr;
         rxfer.direction                = kLPI2C_Read;
         rxfer.data                     = rdata;
-        rxfer.dataSize                 = readCount;
+        rxfer.dataSize                 = readLen;
         rxfer.flags                    = kLPI2C_TransferRepeatedStartFlag;
 
         status = LPI2C_MasterTransferBlocking(LPI2C0, &rxfer);
@@ -637,6 +732,23 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
         {
             i2c_recover_if_needed(status);
             return append_str(outBuf, 0, i2c_error_str(status));
+        }
+
+        if (smbusPec)
+        {
+            /* dataLen here already reflects only the write-phase bytes
+             * actually sent -- X's write phase never got its own PEC
+             * appended above (that only happens for a plain W), so this
+             * correctly covers just the real write data before folding
+             * in the repeated-start read address and read data. */
+            uint8_t pec = smbus_pec_byte(0U, (uint8_t)((addr << 1) | 0U));
+            pec         = smbus_pec_buf(pec, data, dataLen);
+            pec         = smbus_pec_byte(pec, (uint8_t)((addr << 1) | 1U));
+            pec         = smbus_pec_buf(pec, rdata, readCount);
+            if (pec != rdata[readCount])
+            {
+                return append_str(outBuf, 0, "ERR pec (SMBus packet error check failed)");
+            }
         }
 
         uint32_t pos = append_str(outBuf, 0, "OK");
@@ -656,12 +768,23 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
             return append_str(outBuf, 0, "ERR bad count");
         }
 
+        /* See the X/XS read phase above for why one extra byte is
+         * requested when smbusPec is set, and why it's checked against
+         * I2C_CMD_MAX_DATA again here (count alone can pass the check
+         * above yet still overflow rdata[] once the trailing PEC byte
+         * is added on top of it). */
+        uint32_t readLen = count + (smbusPec ? 1U : 0U);
+        if (readLen > I2C_CMD_MAX_DATA)
+        {
+            return append_str(outBuf, 0, "ERR bad count");
+        }
+
         uint8_t rdata[I2C_CMD_MAX_DATA];
         lpi2c_master_transfer_t xfer = {0};
         xfer.slaveAddress             = (uint16_t)addr;
         xfer.direction                = kLPI2C_Read;
         xfer.data                     = rdata;
-        xfer.dataSize                 = count;
+        xfer.dataSize                 = readLen;
         xfer.flags                    = kLPI2C_TransferDefaultFlag;
 
         status_t status = LPI2C_MasterTransferBlocking(LPI2C0, &xfer);
@@ -669,6 +792,16 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
         {
             i2c_recover_if_needed(status);
             return append_str(outBuf, 0, i2c_error_str(status));
+        }
+
+        if (smbusPec)
+        {
+            uint8_t pec = smbus_pec_byte(0U, (uint8_t)((addr << 1) | 1U));
+            pec         = smbus_pec_buf(pec, rdata, count);
+            if (pec != rdata[count])
+            {
+                return append_str(outBuf, 0, "ERR pec (SMBus packet error check failed)");
+            }
         }
 
         uint32_t pos = append_str(outBuf, 0, "OK");
