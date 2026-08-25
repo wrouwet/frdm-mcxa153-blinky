@@ -69,7 +69,15 @@ static uint8_t s_countryCode[COMM_FEATURE_DATA_SIZE] = {(COUNTRY_SETTING >> 0U) 
 
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static usb_cdc_acm_info_t s_usbCdcAcmInfo;
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_currRecvBuf[DATA_BUFF_SIZE];
-USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_currSendBuf[DATA_BUFF_SIZE];
+/* Sized independently of DATA_BUFF_SIZE (which is tied to the USB
+ * endpoint's max packet size, 64 bytes, and only actually constrains
+ * s_currRecvBuf below): USB_DeviceCdcAcmSend() already transparently
+ * spans multiple packets for a longer buffer (see the ZLP-handling logic
+ * in kUSB_DeviceCdcEventSendResponse), so the real ceiling on a reply is
+ * just this array's size, not one packet. Needs to be big enough for the
+ * longest reply process_command() can produce -- see I2C_CMD_MAX_DATA. */
+#define SEND_BUF_SIZE 160U
+USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_currSendBuf[SEND_BUF_SIZE];
 volatile static uint32_t s_sendSize = 0;
 
 /* Command line assembly. Bytes arrive here as USB packets (possibly one
@@ -356,9 +364,17 @@ void USB_DeviceIsrEnable(void)
  *   > X 50 2 00
  *   < OK a1 b2
  ******************************************************************************/
-/* Keep replies within one 64-byte USB full-speed packet: "OK" + N * "
- * xx" + "\r\n" must fit, so N <= 16 leaves comfortable headroom. */
-#define I2C_CMD_MAX_DATA 16U
+/* Ceiling on how much data a single command can move, both what W/X can
+ * write and what R/X/I/L can read/capture. Constrained only by
+ * SEND_BUF_SIZE now ("OK" + N * " xx" + "\r\n" <= SEND_BUF_SIZE), not by
+ * a single USB packet -- multi-packet replies work fine (see
+ * SEND_BUF_SIZE's comment). Sized with real IPMI traffic in mind: a
+ * smaller 16 silently truncated a standard 18-byte Get Device ID
+ * response, dropping the trailing checksum byte and making every
+ * response look checksum-invalid even though the actual exchange was
+ * fine (caught 2026-08-24); 32 leaves headroom for that plus the longer
+ * variant with an Auxiliary Firmware Revision field (22 bytes). */
+#define I2C_CMD_MAX_DATA 32U
 
 static const char *skip_spaces(const char *p)
 {
