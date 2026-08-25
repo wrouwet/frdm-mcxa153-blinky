@@ -341,10 +341,14 @@ void USB_DeviceIsrEnable(void)
  *                                  (like OpenBIC/IPMB) that respond by
  *                                  becoming bus master themselves rather
  *                                  than being read from
+ *   L <ourAddr>                    like I, but with no write of our own
+ *                                  first -- just listen; useful for
+ *                                  independently testing the slave-mode
+ *                                  RX path against some other master
  *
  * Replies (also LF/CRLF terminated):
  *   OK                             W succeeded
- *   OK <byte> [byte ...]           R/X/I succeeded, with the data
+ *   OK <byte> [byte ...]           R/X/I/L succeeded, with the data
  *   OK <addr> [addr ...]           S succeeded (may be empty if nothing found)
  *   ERR <reason>                   something went wrong
  *
@@ -479,7 +483,7 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
     }
     p++;
 
-    if (cmd != 'S' && cmd != 'W' && cmd != 'R' && cmd != 'X' && cmd != 'I')
+    if (cmd != 'S' && cmd != 'W' && cmd != 'R' && cmd != 'X' && cmd != 'I' && cmd != 'L')
     {
         return append_str(outBuf, 0, "ERR bad command");
     }
@@ -507,6 +511,35 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
                 outBuf[pos++] = ' ';
                 pos           = append_hex_byte(outBuf, pos, (uint8_t)addr);
             }
+        }
+        return pos;
+    }
+
+    if (cmd == 'L')
+    {
+        /* Listen only, with no write of our own first -- useful on its own
+         * for independently verifying the slave-mode RX path (e.g. against
+         * a master that isn't us), decoupled from whatever an "I" command's
+         * own write step might be doing. */
+        uint32_t ourAddr;
+        if (!parse_hex_u32(&p, &ourAddr, 2U) || ourAddr > 0x7FU)
+        {
+            return append_str(outBuf, 0, "ERR bad address");
+        }
+
+        uint8_t rdata[I2C_CMD_MAX_DATA];
+        uint32_t rlen = 0;
+        bool got = I2C_SlaveWaitForWrite((uint8_t)ourAddr, rdata, I2C_CMD_MAX_DATA, &rlen, 16U);
+        if (!got)
+        {
+            return append_str(outBuf, 0, "ERR timeout waiting for a write");
+        }
+
+        uint32_t pos = append_str(outBuf, 0, "OK");
+        for (uint32_t i = 0; i < rlen; i++)
+        {
+            outBuf[pos++] = ' ';
+            pos           = append_hex_byte(outBuf, pos, rdata[i]);
         }
         return pos;
     }

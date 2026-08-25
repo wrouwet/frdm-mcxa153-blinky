@@ -82,6 +82,7 @@ decimal byte count.
 | `X <addr> <n> <byte> [byte ...]` | write bytes, repeated-start, then read `<n>` bytes (the classic "select register, then read" pattern) |
 | `S` | scan the bus, list responding addresses |
 | `I <addr> <ourAddr> <byte> [byte ...]` | write bytes to `<addr>`, then briefly become an I2C *slave* at `<ourAddr>` and capture whatever `<addr>` writes back |
+| `L <ourAddr>` | like `I`, but with no write of our own first -- just listen (useful for independently testing the slave-mode RX path against some other master) |
 
 Replies: `OK` (write), `OK <byte> [byte ...]` (read/scan/`I`), or
 `ERR <reason>` (e.g. `ERR nak`, `ERR timeout ...`, `ERR bad address`).
