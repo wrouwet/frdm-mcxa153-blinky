@@ -75,8 +75,11 @@ USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_currRecvBuf[DAT
  * spans multiple packets for a longer buffer (see the ZLP-handling logic
  * in kUSB_DeviceCdcEventSendResponse), so the real ceiling on a reply is
  * just this array's size, not one packet. Needs to be big enough for the
- * longest reply process_command() can produce -- see I2C_CMD_MAX_DATA. */
-#define SEND_BUF_SIZE 160U
+ * longest reply process_command() can produce ("OK" + N * " xx" + "\r\n"
+ * for N = I2C_CMD_MAX_DATA bytes -- see that constant's comment for why
+ * it's sized the way it is). 400 comfortably covers "OK" + 128*" xx" +
+ * "\r\n" (388) with headroom. */
+#define SEND_BUF_SIZE 400U
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE) static uint8_t s_currSendBuf[SEND_BUF_SIZE];
 volatile static uint32_t s_sendSize = 0;
 
@@ -84,8 +87,11 @@ volatile static uint32_t s_sendSize = 0;
  * character at a time, from an interactive terminal); s_lineReady is set
  * once a full line has accumulated, and cleared again by APPTask() once
  * it has built a reply. While a completed line is waiting to be answered,
- * no further receive is armed (simple half-duplex command/response). */
-#define LINE_BUF_SIZE 128U
+ * no further receive is armed (simple half-duplex command/response).
+ * Needs to hold the longest *input* line too, not just replies -- a
+ * worst-case "XS <addr> <count> <128 hex data bytes>" write is close to
+ * 400 characters, same headroom reasoning as SEND_BUF_SIZE. */
+#define LINE_BUF_SIZE 400U
 static char s_lineBuf[LINE_BUF_SIZE];
 static uint32_t s_lineLen             = 0;
 volatile static bool s_lineReady      = false;
@@ -382,15 +388,30 @@ void USB_DeviceIsrEnable(void)
  ******************************************************************************/
 /* Ceiling on how much data a single command can move, both what W/X can
  * write and what R/X/I/L can read/capture. Constrained only by
- * SEND_BUF_SIZE now ("OK" + N * " xx" + "\r\n" <= SEND_BUF_SIZE), not by
- * a single USB packet -- multi-packet replies work fine (see
- * SEND_BUF_SIZE's comment). Sized with real IPMI traffic in mind: a
- * smaller 16 silently truncated a standard 18-byte Get Device ID
- * response, dropping the trailing checksum byte and making every
- * response look checksum-invalid even though the actual exchange was
- * fine (caught 2026-08-24); 32 leaves headroom for that plus the longer
- * variant with an Auxiliary Firmware Revision field (22 bytes). */
-#define I2C_CMD_MAX_DATA 32U
+ * SEND_BUF_SIZE/LINE_BUF_SIZE now ("OK" + N * " xx" + "\r\n" <=
+ * SEND_BUF_SIZE, and a worst-case input line <= LINE_BUF_SIZE -- see
+ * both constants' comments), not by a single USB packet -- multi-packet
+ * transfers work fine either direction.
+ *
+ * Originally sized for IPMI/IPMB traffic (a smaller 16 silently
+ * truncated a standard 18-byte Get Device ID response, dropping the
+ * trailing checksum byte and making every response look
+ * checksum-invalid even though the actual exchange was fine -- caught
+ * 2026-08-24; 32 covered that plus the longer Aux-FW-Revision variant).
+ *
+ * Bumped from 32 to 128 to comfortably fit a full, unfragmented MCTP
+ * packet for future MCTP-over-SMBus testing: per DSP0236 (the MCTP base
+ * spec), every compliant endpoint must support a 64-byte baseline MTU
+ * (payload), and the MCTP transport header adds 4 more bytes on top of
+ * that -- 68 bytes minimum, plus 1 more for this bridge's own SMBus PEC
+ * byte (see WS/RS/XS above) = 69 bytes minimum needed for a single
+ * baseline-MTU MCTP request/response to round-trip through this bridge
+ * without fragmentation-handling logic here. 128 leaves real headroom
+ * above that minimum (some MCTP profiles negotiate larger MTUs) without
+ * costing much RAM on a chip this size. If a future need exceeds even
+ * this, the right fix is proper multi-packet reassembly in whatever's
+ * driving the bridge, not another one-off bump here. */
+#define I2C_CMD_MAX_DATA 128U
 
 static const char *skip_spaces(const char *p)
 {
