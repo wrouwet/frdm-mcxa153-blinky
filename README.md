@@ -47,7 +47,23 @@ For `usb_vcom`, after flashing, plug a **data-capable** USB-C cable (not a
 charge-only one) into the board's lower Type-C port (silkscreened "MCU
 USB", labeled `J8` in the schematic) while leaving the MCU-Link port
 connected. Wire an I2C target's SCL/SDA (+ GND) to the board's mikroBUS
-header (`J5`: `SCL`/`SDA` pins, wired to the MCX A153's `P3_27`/`P3_28`).
+header, **`J5`**, using these exact pins (confirmed against NXP's own
+FRDM-MCXA153 quick start guide — mikroBUS pin *position* on this header
+does not follow a simple top-to-bottom 1-8 order, so don't guess from the
+header's physical layout alone):
+
+| J5 pin | Signal | MCX A153 pin |
+|---|---|---|
+| 5 | SCL | `P3_27` |
+| 6 | SDA | `P3_28` |
+| 8 | GND | — |
+
+The I2C target board needs its **own power supply** — this bridge only
+drives the I2C signal lines (with weak internal pull-ups enabled, mainly
+useful for bench-testing with nothing else attached; a real target
+should supply its own, stronger pull-ups once wired in), it does not
+power the other board.
+
 It enumerates as `NXP MCU VIRTUAL COM DEMO` (`1fc9:0094`). **Don't assume
 it's `/dev/ttyACM0` or `/dev/ttyACM1`** — the MCU-Link debug probe also
 exposes its own (unrelated) ttyACM device, and which one gets which
