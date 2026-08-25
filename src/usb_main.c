@@ -513,7 +513,22 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
          * it only enqueues the START command into the hardware FIFO and
          * returns, without waiting to see whether the address was
          * actually acknowledged on the bus -- so it can't be used to
-         * detect a NAK by itself.) */
+         * detect a NAK by itself.)
+         *
+         * Unlike every other command below, this loop originally never
+         * called i2c_recover_if_needed() on a failed probe -- meaning a
+         * scan issued while the bus happened to be wedged (e.g. right
+         * after two closely-spaced master writes collided, one seeing
+         * arbitration loss) silently came back completely empty and
+         * *stayed* wedged, since nothing here ever recovered it. Every
+         * other command (W/R/X/I) already self-heals this way; a plain
+         * scan reasonably needs to as well, since it's often the first
+         * thing run in a new session and has no other error path to
+         * surface the problem through (found 2026-08-24 via the test
+         * framework: a scan run immediately after a deliberate
+         * back-to-back-write stress test came back empty, while a
+         * subsequent W-based command succeeded normally because it, not
+         * the scan, happened to trigger recovery). */
         uint32_t pos = append_str(outBuf, 0, "OK");
         for (uint32_t addr = 0x08U; addr <= 0x77U; addr++)
         {
@@ -522,10 +537,15 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
             probe.direction                = kLPI2C_Write;
             probe.flags                    = kLPI2C_TransferDefaultFlag;
 
-            if (kStatus_Success == LPI2C_MasterTransferBlocking(LPI2C0, &probe))
+            status_t status = LPI2C_MasterTransferBlocking(LPI2C0, &probe);
+            if (kStatus_Success == status)
             {
                 outBuf[pos++] = ' ';
                 pos           = append_hex_byte(outBuf, pos, (uint8_t)addr);
+            }
+            else
+            {
+                i2c_recover_if_needed(status);
             }
         }
         return pos;
