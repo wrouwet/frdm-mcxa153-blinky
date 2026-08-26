@@ -400,13 +400,18 @@ void USB_DeviceIsrEnable(void)
  * 2026-08-24; 32 covered that plus the longer Aux-FW-Revision variant).
  *
  * Bumped from 32 to 128 to comfortably fit a full, unfragmented MCTP
- * packet for future MCTP-over-SMBus testing: per DSP0236 (the MCTP base
+ * packet for future MCTP-over-SMBus testing. Per DSP0236 (the MCTP base
  * spec), every compliant endpoint must support a 64-byte baseline MTU
  * (payload), and the MCTP transport header adds 4 more bytes on top of
- * that -- 68 bytes minimum, plus 1 more for this bridge's own SMBus PEC
- * byte (see WS/RS/XS above) = 69 bytes minimum needed for a single
- * baseline-MTU MCTP request/response to round-trip through this bridge
- * without fragmentation-handling logic here. 128 leaves real headroom
+ * that -- 68 bytes. DSP0237 (the SMBus/I2C transport binding) adds a
+ * further 3-byte block-write wrapper (cmd_code + byte_count + src_addr)
+ * *before* the transport header on every frame -- easy to miss (an
+ * initial mctp-test-environment implementation did, and every frame got
+ * silently discarded target-side as a result, caught 2026-08-25) -- plus
+ * 1 more byte for this bridge's own SMBus PEC (see WS/RS/XS above) = 72
+ * bytes minimum needed for a single baseline-MTU MCTP request/response
+ * to round-trip through this bridge without fragmentation-handling logic
+ * here. 128 leaves real headroom
  * above that minimum (some MCTP profiles negotiate larger MTUs) without
  * costing much RAM on a chip this size. If a future need exceeds even
  * this, the right fix is proper multi-packet reassembly in whatever's
