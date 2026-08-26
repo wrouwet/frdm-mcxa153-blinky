@@ -3,29 +3,57 @@
 Turns NXP's [FRDM-MCXA153](https://www.nxp.com/design/design-center/development-boards-and-designs/FRDM-MCXA153)
 board (MCX A153, Arm Cortex-M33) into a USB-to-I2C bridge: plug it into a
 host PC over its "MCU USB" port, wire an I2C target to its mikroBUS
-header, and drive that target's I2C bus with simple text commands over a
-USB CDC virtual COM port. Once flashed, the board runs standalone off
-that one USB cable — no debug probe or separate power needed.
+header, and drive that target's I2C bus with simple text commands sent
+over a plain USB serial connection. Once flashed, the board runs
+standalone off that one USB cable — no debug probe, no special drivers,
+and no vendor tools required to actually *use* it.
 
 Built from scratch as a minimal, command-line-only development
 environment for this board: no IDE, no MCUXpresso installer, just
 `arm-none-eabi-gcc`, `make`, and [`probe-rs`](https://probe.rs/) (used
 only for flashing, over the board's on-board MCU-Link debug probe).
 
-Two firmware targets share the same toolchain and vendor tree:
+## Two completely separate communication channels — don't confuse them
 
-- **`usb_vcom`** — the USB-to-I2C hub itself. Brings up a USB CDC-ACM
-  virtual COM port on the MCX A153's *own* USB0 controller (the board's
-  second, "MCU USB" Type-C connector — separate from the MCU-Link debug
-  port), and bridges it to an LPI2C0 master, so a host PC can drive I2C
-  devices on another board through this one. Also blinks the red LED
-  (~2 Hz) as a standalone heartbeat.
-- **`blinky`** — a minimal standalone LED blink demo (GPIO3 pin 12),
-  kept as the simplest possible "does my toolchain work" sanity check.
+This firmware talks to the outside world two different ways, over two
+different USB connectors, for two different purposes. Mixing them up is
+an easy, understandable mistake — here's the disambiguation up front:
 
-Both stream progress messages back over SWD via a minimal hand-rolled
-SEGGER RTT implementation (`src/rtt.c`), so you can see what the firmware
-is doing without a UART.
+1. **The bridge itself: a standard USB CDC-ACM virtual COM port.**
+   This is what a host PC actually uses to drive I2C. It's an ordinary
+   USB-to-serial device — no SEGGER software, no special drivers, no
+   debug probe needed. It enumerates as `NXP MCU VIRTUAL COM DEMO`
+   (USB VID:PID `1fc9:0094`) on the board's **"MCU USB"** Type-C
+   connector (the *lower* one, separate from the debug connector) and
+   shows up as a plain serial device — `/dev/ttyACM*` on Linux, a COM
+   port on Windows/macOS. **Any terminal program or serial library on
+   any host PC can talk to it** — a real terminal emulator (`screen`,
+   `minicom`, PuTTY), a raw `stty`+`cat`+`printf` combo (see below), or
+   a scripting library like Python's `pyserial`. You send it plain
+   ASCII text commands (one per line, e.g. `S` to scan the bus) and it
+   sends back plain ASCII text replies — see "I2C bridge command
+   syntax" below for the full protocol. This is the *only* channel
+   needed for normal use, and the *only* one that works standalone,
+   without a debug probe attached.
+
+2. **Debug logging only: SEGGER RTT over SWD.** Both firmware targets
+   (`usb_vcom` and `blinky`) also print internal debug/status messages
+   (`rtt_puts()`, a minimal hand-rolled implementation in `src/rtt.c`)
+   using [SEGGER RTT](https://www.segger.com/products/debug-probes/j-link/technology/about-real-time-transfer/),
+   a mechanism for streaming text over the SWD debug connection instead
+   of a UART. This is **development/troubleshooting output only** — it
+   has nothing to do with the I2C bridge protocol, isn't how you send
+   bridge commands, and **requires the on-board MCU-Link debug probe to
+   be connected** plus `probe-rs` (or J-Link/SEGGER tools) running on
+   the host, e.g. `probe-rs attach --chip MCXA153 build/usb_vcom/usb_vcom.elf`.
+   A "random Linux host PC" with no probe-rs installed and no debug
+   cable plugged in cannot see this output at all, and doesn't need to
+   — it's purely a "what is the firmware doing internally" view for
+   whoever is actively developing/debugging the firmware itself.
+
+If you just want to *use* an already-flashed board from a normal Linux
+machine: plug in the MCU USB cable (channel 1 above), ignore RTT/SWD
+entirely, and jump to "Build, flash, run" below for exact commands.
 
 ## Prerequisites
 
@@ -45,8 +73,10 @@ probe-rs run --chip MCXA153 build/blinky/blinky.elf   # flash + live RTT log
 
 For `usb_vcom`, after flashing, plug a **data-capable** USB-C cable (not a
 charge-only one) into the board's lower Type-C port (silkscreened "MCU
-USB", labeled `J8` in the schematic) while leaving the MCU-Link port
-connected. Wire an I2C target's SCL/SDA (+ GND) to the board's mikroBUS
+USB", labeled `J8` in the schematic). The debug/MCU-Link cable can stay
+connected or be unplugged at this point — it's only needed again the
+next time you want to reflash; the board runs the bridge standalone off
+the MCU USB cable alone. Wire an I2C target's SCL/SDA (+ GND) to the board's mikroBUS
 header, **`J5`**, using these exact pins (confirmed against NXP's own
 FRDM-MCXA153 quick start guide — mikroBUS pin *position* on this header
 does not follow a simple top-to-bottom 1-8 order, so don't guess from the
@@ -76,6 +106,22 @@ for dev in /sys/class/tty/ttyACM*; do
 done
 # use whichever one prints "MCU VIRTUAL COM DEMO"
 ```
+
+No `probe-rs`, no debug cable, and no special drivers are needed for
+anything below — this is a plain USB serial device, so any of the usual
+ways of talking to one work. Two options:
+
+**A real interactive terminal**, if you just want to type commands by
+hand and see replies scroll by:
+
+```sh
+screen /dev/ttyACM0 115200      # or: minicom -D /dev/ttyACM0 -b 115200
+# type e.g. "S" + Enter to scan the bus; Ctrl-A then k to exit screen
+```
+
+**Scripted, non-interactive access** — what this repo's own automated
+test suites (see "Host-side test suite" below) actually use under the
+hood, just with raw shell commands instead of a Python serial library:
 
 ```sh
 stty -F /dev/ttyACM0 raw -echo speed 115200
