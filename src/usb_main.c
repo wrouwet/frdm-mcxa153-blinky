@@ -465,6 +465,30 @@ static bool parse_hex_u32(const char **pp, uint32_t *out, uint32_t maxDigits)
     return true;
 }
 
+/* Non-consuming peek: does at least one more hex byte token follow at
+ * p? Takes p by value (a local copy), so parse_hex_u32()'s internal
+ * pointer advancement never escapes back to the caller -- this only
+ * answers "is there more", it doesn't advance anything.
+ *
+ * Exists to catch a real silent-truncation bug (found 2026-08-25 via
+ * the host-side MCTP test project): a W/WS/I command line whose hex
+ * data exceeds this buffer's capacity used to just stop parsing at the
+ * cap and silently ignore the rest of the line, still sending whatever
+ * fit and replying "OK" -- so a too-long write appeared to succeed
+ * while actually transmitting a truncated, corrupted payload. It took
+ * the *receiving* device's own console log to reveal that a "244-byte"
+ * write had actually arrived as 128 bytes; from this bridge's side,
+ * nothing ever indicated a problem. Exactly the same class of bug as
+ * an earlier one on the *reply* side (I2C_CMD_MAX_DATA needing to grow
+ * to stop truncating IPMI responses) -- this is the mirror image of
+ * that, on the way in instead of out, and deserves the same "make it
+ * loud" fix rather than another silent length-limit bump. */
+static bool has_more_hex_data(const char *p)
+{
+    uint32_t dummy;
+    return parse_hex_u32(&p, &dummy, 2U);
+}
+
 static bool parse_dec_u32(const char **pp, uint32_t *out)
 {
     const char *p = skip_spaces(*pp);
@@ -700,6 +724,10 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
         {
             data[dataLen++] = (uint8_t)byte;
         }
+        if (dataLen == dataMax && has_more_hex_data(p))
+        {
+            return append_str(outBuf, 0, "ERR data too long");
+        }
 
         /* Appending a plain write's PEC has to happen here, before the
          * transfer, since it must go out as part of the SAME START..STOP
@@ -853,6 +881,10 @@ static uint32_t process_command(const char *line, uint32_t lineLen, char *outBuf
         while (dataLen < I2C_CMD_MAX_DATA && parse_hex_u32(&p, &byte, 2U))
         {
             data[dataLen++] = (uint8_t)byte;
+        }
+        if (dataLen == I2C_CMD_MAX_DATA && has_more_hex_data(p))
+        {
+            return append_str(outBuf, 0, "ERR data too long");
         }
 
         lpi2c_master_transfer_t xfer = {0};
